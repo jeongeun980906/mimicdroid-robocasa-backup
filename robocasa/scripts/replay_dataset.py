@@ -22,7 +22,13 @@ import robocasa
 import robocasa.macros as macros
 from robocasa.environments.kitchen.play_env.play_env import *
 
-from robocasa.utils.mimicdroid_utils import make_env, reset_to, get_zero_action, EnvArgs
+from robocasa.utils.mimicdroid_utils import (
+    make_env,
+    reset_to,
+    get_zero_action,
+    resample_actions,
+    EnvArgs,
+)
 
 # Disable sites for cleaner rendering
 macros.SHOW_SITES = False
@@ -87,6 +93,18 @@ def replay_episode(env, hdf5_path, ep_name, env_args: EnvArgs, args: argparse.Na
     states = ep_group["states"][:]  # shape: (T, state_dim)
     actions = ep_group["actions"][:]  # shape: (T, action_dim)
 
+    # Optionally slow down (or speed up) playback by resampling the absolute targets.
+    speed = getattr(args, "speed", 1.0)
+    if speed != 1.0:
+        orig_len = len(actions)
+        actions = resample_actions(actions, speed)
+        print(
+            colored(
+                f"Resampled actions for {speed}x speed: {orig_len} -> {len(actions)} steps",
+                "magenta",
+            )
+        )
+
     # Get episode metadata
     ep_meta = ep_group.attrs.get("ep_meta", {})
     if isinstance(ep_meta, str):
@@ -123,9 +141,32 @@ def replay_episode(env, hdf5_path, ep_name, env_args: EnvArgs, args: argparse.Na
         change_to_gr1="GR1" in env_args.robots,
     )
 
+    video_frames = []
+
+    # Optional warm-start: hold the first target so the arms servo to it before
+    # the real trajectory begins. This removes the large initial tracking gap
+    # caused by the robot resetting to its home pose rather than the demo's arm
+    # pose (see analyze_ik_error.py for the diagnosis).
+    warm_start_steps = getattr(args, "warm_start_steps", 0)
+    if warm_start_steps > 0 and len(actions) > 0:
+        print(
+            colored(
+                f"Warm-start: settling to first target for {warm_start_steps} steps...",
+                "yellow",
+            )
+        )
+        for _ in range(warm_start_steps):
+            if env_args.render:
+                env.render()
+                time.sleep(0.05)
+            obs, _, _, _ = env.step(actions[0])
+            if args.save_videos:
+                keys = [key for key in obs.keys() if "_image" in key]
+                image = np.concatenate([obs[key][::-1][..., ::-1] for key in keys], axis=1)
+                video_frames.append(image)
+
     # Replay actions
     print(colored(f"Replaying {len(actions)} actions...", "yellow"))
-    video_frames = []
 
     for i, action in enumerate(actions):
         if env_args.render:
@@ -154,13 +195,20 @@ def replay_episode(env, hdf5_path, ep_name, env_args: EnvArgs, args: argparse.Na
         colored(f"Episode completed. Success: {success}", "green" if success else "red")
     )
     if args.save_videos:
-        # create a tmp file in /tmp/ep_name_time.mp4
-        tmp_file = f"/tmp/{ep_name}_{time.time()}.mp4"
-        video_writer = cv2.VideoWriter(tmp_file, cv2.VideoWriter_fourcc(*'mp4v'), 30, (video_frames[0].shape[1], video_frames[0].shape[0]))
+        # Save to the requested video directory, named by episode + robot + speed
+        # (+ warm-start) so different embodiments/settings never overwrite each other.
+        video_dir = getattr(args, "video_dir", None) or "videos"
+        os.makedirs(video_dir, exist_ok=True)
+        robots = env_args.robots
+        robot_tag = "_" + ("".join(robots) if isinstance(robots, list) else robots)
+        speed_tag = f"_{speed}x" if speed != 1.0 else ""
+        warm_tag = f"_warm{warm_start_steps}" if warm_start_steps > 0 else ""
+        out_file = os.path.join(video_dir, f"{ep_name}{robot_tag}{speed_tag}{warm_tag}.mp4")
+        video_writer = cv2.VideoWriter(out_file, cv2.VideoWriter_fourcc(*'mp4v'), 30, (video_frames[0].shape[1], video_frames[0].shape[0]))
         for frame in video_frames:
             video_writer.write(frame)
         video_writer.release()
-        print(colored(f"Video saved to {tmp_file}", "green"))
+        print(colored(f"Video saved to {out_file}", "green"))
     return success
 
 
@@ -206,10 +254,36 @@ def main():
         help="Whether to save a video of the episode",
     )
     parser.add_argument(
-        "--reset_mode", 
+        "--video_dir",
+        type=str,
+        default="/mnt/ddn/tmp/replay_videos",
+        help="Directory to save replay videos (named <episode>_<speed>x.mp4)",
+    )
+    parser.add_argument(
+        "--warm_start_steps",
+        type=int,
+        default=0,
+        help=(
+            "Number of steps to hold the first action before replay, letting the "
+            "arms servo to the first target from the home pose (removes the large "
+            "initial IK tracking gap). 0 disables. Try 30."
+        ),
+    )
+    parser.add_argument(
+        "--reset_mode",
         type=str,
         default=None,
         help="Reset mode"
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help=(
+            "Action replay speed multiplier. <1.0 slows down playback by inserting "
+            "interpolated absolute targets (e.g. 0.7 for 0.7x speed), which improves "
+            "IK tracking and reduces replay failures. 1.0 = original speed."
+        ),
     )
     args = parser.parse_args()
     if args.save_videos:

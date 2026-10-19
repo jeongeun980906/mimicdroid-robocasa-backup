@@ -11,6 +11,8 @@ from lxml import etree
 from dataclasses import dataclass
 from typing import Optional, Union, List
 
+from scipy.spatial.transform import Rotation, Slerp
+
 import robosuite
 from robosuite.utils.binding_utils import MjSimState
 from robosuite.controllers import load_composite_controller_config
@@ -63,6 +65,7 @@ class EnvArgs:
     render: bool = False
     control_freq: int = 20
     use_camera_obs: bool = False
+    camera_segmentations: Optional[str] = "instance"
 
 
 def get_env_args_from_dataset(dataset_path):
@@ -200,6 +203,71 @@ def replace_robot_tag(new_model_xml, old_model_xml):
     return ET.tostring(new_root, encoding="unicode")
 
 
+def resample_actions(actions, speed, pose_blocks=(0, 6), gripper_idx=(12, 13)):
+    """Resample an absolute-action trajectory to play back at a different speed.
+
+    The MimicDroid datasets use absolute pose targets (input_type == "absolute"),
+    so slowing playback down is done by inserting interpolated targets between the
+    recorded ones. At ``speed=0.7`` the robot is given ~1/0.7x as many targets, each
+    advancing only 0.7 of the way, so it moves more slowly and the IK controller
+    tracks each target more accurately (fewer replay failures).
+
+    Args:
+        actions (np.ndarray): (T, action_dim) recorded absolute actions.
+        speed (float): playback speed multiplier. <1.0 slows down, >1.0 speeds up.
+        pose_blocks (tuple[int]): start index of each 6-DoF eef pose block
+            (3 position dims + 3 axis-angle rotation dims). Default matches the
+            14-dim two-hand layout: right pose [0:6], left pose [6:12].
+        gripper_idx (tuple[int]): indices of discrete gripper command dims, held
+            with nearest-neighbor (never blended) to preserve open/close commands.
+
+    Returns:
+        np.ndarray: (new_T, action_dim) resampled absolute actions.
+    """
+    actions = np.asarray(actions, dtype=np.float64)
+    T, action_dim = actions.shape
+    if speed == 1.0 or T < 2:
+        return actions
+
+    # Validate that the assumed layout fits this action dimension. Fall back to a
+    # pure linear interpolation (no slerp / gripper handling) for unexpected dims.
+    layout_ok = action_dim == 14 and all(b + 6 <= action_dim for b in pose_blocks)
+
+    # New timeline: fractional indices into the original [0, T-1] trajectory.
+    # Use linspace so the first and last recorded targets are hit exactly (the
+    # trajectory still reaches its final goal), while the average step spacing
+    # stays ~= speed.
+    new_T = int(round((T - 1) / speed)) + 1
+    src_times = np.linspace(0.0, T - 1, new_T)
+
+    new_actions = np.empty((new_T, action_dim), dtype=np.float64)
+    lo = np.floor(src_times).astype(int)
+    hi = np.minimum(lo + 1, T - 1)
+    frac = (src_times - lo)[:, None]
+
+    # Default: linear interpolation for every dim.
+    new_actions[:] = (1.0 - frac) * actions[lo] + frac * actions[hi]
+
+    if layout_ok:
+        # Proper slerp for the 3-dim axis-angle rotation part of each pose block.
+        for b in pose_blocks:
+            rot_lo = Rotation.from_rotvec(actions[lo, b + 3 : b + 6])
+            rot_hi = Rotation.from_rotvec(actions[hi, b + 3 : b + 6])
+            for j in range(new_T):
+                if lo[j] == hi[j]:
+                    new_actions[j, b + 3 : b + 6] = actions[lo[j], b + 3 : b + 6]
+                    continue
+                slerp = Slerp([0.0, 1.0], Rotation.concatenate([rot_lo[j], rot_hi[j]]))
+                new_actions[j, b + 3 : b + 6] = slerp(frac[j, 0]).as_rotvec()
+
+        # Grippers: nearest-neighbor so open/close commands are never blended.
+        nearest = np.clip(np.round(src_times).astype(int), 0, T - 1)
+        for g in gripper_idx:
+            new_actions[:, g] = actions[nearest, g]
+
+    return new_actions
+
+
 def get_zero_action(env):
     """Get zero action for the environment."""
     active_robot = env.robots[0]
@@ -274,7 +342,7 @@ def make_env(file_name, env_args: EnvArgs):
         has_renderer=env_args.render,
         use_camera_obs=env_args.use_camera_obs,
         renderer="mjviewer",
-        camera_segmentations="instance",
+        camera_segmentations=env_args.camera_segmentations,
         control_freq=env_args.control_freq,
         **env_kwargs,
     )

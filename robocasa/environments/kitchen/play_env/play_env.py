@@ -439,6 +439,57 @@ class TurnOnFaucet(SinkEnvForPlay):
         return super()._load_model(*args, **kwargs)
 
 
+# --- reverse-behavior tasks: same scene as SinkEnvForPlay but the cab_sink door
+# starts CLOSED (open task) / the faucet starts ON (turn-off task). Base
+# _reset_internal sets door open + faucet off, so we flip the relevant one after. ---
+class OpenLeftCabinetDoor(SinkEnvForPlay):
+    def _reset_internal(self):
+        super()._reset_internal()
+        if self.cab_sink is not None:
+            self.cab_sink.set_door_state(min=0.0, max=0.1, env=self, rng=self.rng)
+
+    def _check_success(self):
+        return self._check_cab_sink_door_success("left", 0.9, "greater")
+
+    def _load_model(self, *args, **kwargs):
+        if hasattr(self, "eval_mode") and self.eval_mode == "diff_obj":
+            self._ep_meta["style_ids"] = self.TRAIN_STYLE_IDS
+            self._ep_meta["style_id"] = np.random.choice(self._ep_meta["style_ids"])
+        return super()._load_model(*args, **kwargs)
+
+
+class OpenRightCabinetDoor(SinkEnvForPlay):
+    def _reset_internal(self):
+        super()._reset_internal()
+        if self.cab_sink is not None:
+            self.cab_sink.set_door_state(min=0.0, max=0.1, env=self, rng=self.rng)
+
+    def _check_success(self):
+        return self._check_cab_sink_door_success("right", 0.9, "greater")
+
+    def _load_model(self, *args, **kwargs):
+        if hasattr(self, "eval_mode") and self.eval_mode == "diff_obj":
+            self._ep_meta["style_ids"] = self.TRAIN_STYLE_IDS
+            self._ep_meta["style_id"] = np.random.choice(self._ep_meta["style_ids"])
+        return super()._load_model(*args, **kwargs)
+
+
+class TurnOffFaucet(SinkEnvForPlay):
+    def _reset_internal(self):
+        super()._reset_internal()
+        self.sink.set_handle_state(mode="on", env=self, rng=self.rng)
+
+    def _check_success(self):
+        handle_state = self.sink.get_handle_state(self)
+        return not handle_state["water_on"]
+
+    def _load_model(self, *args, **kwargs):
+        if hasattr(self, "eval_mode") and self.eval_mode == "diff_obj":
+            self._ep_meta["style_ids"] = self.TRAIN_STYLE_IDS
+            self._ep_meta["style_id"] = np.random.choice(self._ep_meta["style_ids"])
+        return super()._load_model(*args, **kwargs)
+
+
 class PnPSinkToRightCounterPlateL2(StyleMixin, PnPSinkToRightCounterPlate):
     REQUIRED_STYLE_ID = "001_l2"
 
